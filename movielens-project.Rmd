@@ -1,0 +1,634 @@
+---
+title: "MovieLens Project"
+author: "bart-g"
+date: "4/8/2020"
+output:
+  pdf_document: 
+    fig_caption: yes
+    toc: yes
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(caret)
+library(data.table)
+library(timeDate)
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE) 
+```
+
+```{r prerequisite, echo=FALSE, warning=FALSE, results='hide'}
+# prerequisite data preparation
+# - as originally provided on course website
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1) # , sample.kind="Rounding")
+# if using R 3.5 or earlier, use `set.seed(1)` instead
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+    semi_join(edx, by = "movieId") %>%
+    semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation, by = c("userId", "movieId", "rating", "timestamp", "title", "genres"))
+edx <- rbind(edx, removed)
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+## 1. Overview 
+
+The goal of the project is to the predict movie rating given features of the data set provided.
+
+Each record of the data set corresponds to a historical rating of a movie made by a user.
+
+Projection goal of movie rating:
+
+$$y_{u,i}$$ 
+
+depicts rating projection for user (u) on a movie (i).
+
+Two sets of these records, as generated within prerequisite code section, are made available:
+
+- edx for training purpose (9M rows)
+
+- validation for RMSE score testing (1M rows)
+
+Features available:
+
+- userId (integer identifier)
+
+- movieId (numerical)
+
+- rating (numerical)
+
+- timestamp (integer)
+
+- title (character string)
+
+- genres (character string)
+
+Snapshot of the data:
+
+```{r edx features, echo=FALSE}
+# snapshot of the records available
+
+head(edx) %>% knitr::kable()
+```
+
+Unique users & movies in edx training set:
+
+```{r edx users and movies count, echo=FALSE}
+# summary of users and movies sample populations 
+
+tibble(unique_users = n_distinct(edx$userId), unique_movies = n_distinct(edx$movieId)) %>% 
+    knitr::kable(col.names = c("Unique users", "Movies being rated"))
+```
+
+
+## 2. Analysis
+
+Original training set(edx) was partitioned into training set, and a test set constituting 10% of the entire edx set.
+Additionally due to required test set consistency with  users and movies of training set, 
+necessary records were relocated to the test set.
+Given training set we approach the problem by handpicking selected features,
+an regressing ratings onto them. 
+Due to practical considerations direct linear regression cannot be used:
+
+- while model is augmented residuals must be stripped of the impact made (with previously identified features)
+
+Worth noting that if the vast amount of data had been applied in least squares 
+regression, one could argue the slope of each variable used in the modelling could be more
+accurately optimized. 
+
+On the downside: strick linear fit to training data could
+lead to overtraining when out-of-sample/test data validated the model.
+Such overfitting would be arguably greater, than our "modest" effect-selective model, 
+due to growing number of degrees of freedom).
+
+### Error function
+
+RMSE is defined as a mean square error of actual and predicted vectors.
+
+$$RMSE = \sqrt{\frac{1}{n} \sum_{u, i}(y_{u,i} -\hat y_{u,i})^2 }$$
+
+```{r rmse function, echo=FALSE}
+# error function, the RMSE
+
+RMSE <- function(actual_outcomes, predicted_outcomes){
+    sqrt(mean((actual_outcomes - predicted_outcomes)^2))
+}
+```
+
+### Edx training & test sets preparation
+
+We start by partitioning edx data into training set and test set.
+Learning of the model is conducted entirely with edx data.
+
+```{r edx partitioning, echo=FALSE}
+# partitioning of the edx set
+
+set.seed(1) 
+test_index <- createDataPartition(y = edx$rating, times = 1, p = 0.1, list = FALSE)
+train_set <- edx[-test_index,]
+test_set <- edx[test_index,]
+
+# required data re-joining,
+# so final test set is representative of train set movies and users
+test_set <- test_set %>% 
+    semi_join(train_set, by = "movieId") %>%
+    semi_join(train_set, by = "userId")
+rm(test_index)
+```
+
+### 1st model: intercept
+
+Histogram of the ratings directs the attention towards the mean value.
+Mean rating, the intercept, offers an introductory explanatory power.
+Had the dependent variable been centered around zero, we could argue how useful it is for building the model.
+Profoundly intercept mean is greater than zero, so is the mass of the distribution. 
+
+```{r ratings-and-density, echo = FALSE, fig.height=3}
+# plot distribution
+
+train_set %>% ggplot(aes(rating)) +
+    geom_histogram(aes(y = ..density..), binwidth = 1, color = "grey", fill = "lightblue") +
+    geom_density(alpha = 0.1, bw=0.5, fill = "red") + 
+    ggtitle("Ratings histogram with density")
+```
+\
+
+There are two things worth noting:
+
+- distribution exposes negative skewness,
+
+- mass of higher than average ratings is concentrated in the right tail
+
+Indication of abnormality in terms of excess kurtosis is not significant.
+
+Both moments however, are duly noted:
+
+```{r ratings-skewness-kurtosis, echo=FALSE}
+# moments of distribution
+
+tibble(skewness(train_set$rating) , kurtosis(train_set$rating)) %>% 
+  knitr::kable(col.names = c("skewnes", "kurtosis"))
+```
+
+```{r ratings-at-half-points, echo = FALSE, fig.height=3}
+# plot ratings, note the mass of distribution and mean being positive
+
+train_set %>% ggplot(aes(rating)) +
+    geom_histogram(binwidth = 0.5, color = "grey", fill = "lightblue") +
+    ggtitle("Ratings histogram at half-points")
+```
+\
+
+Another finding from half-points histogram:
+
+- half-point ratings aren't as popular as whole point ratings
+
+Proposed model:
+$$y_{u,i} = \mu + \epsilon_{u,i}$$
+
+```{r model1, echo=FALSE}
+# calculate intercept only model
+
+mu_hat <- mean(train_set$rating)
+rmse1 <- RMSE(test_set$rating, mu_hat)
+```
+
+The intercept estimated from the arithmetic mean is:
+```{r intercept value, echo=FALSE}
+mu_hat  %>% knitr::kable(col.names = "Intercept")
+```
+
+RMSE misses the edx actual ratings by more than entire rating point:
+```{r model1 rmse, echo=FALSE}
+rmse1  %>% knitr::kable(col.names = "Model RMSE")
+```
+
+### 2nd model: movie effect
+
+Movies may have inherent bias acquiring ratings particular way.
+
+Hence the attempt to group ratings per movie, called movie effect $b_{i}$
+
+Proposed model:
+$$y_{u,i} = \mu + b_{i} +\epsilon_{u,i}$$
+
+```{r model2, echo=FALSE}
+# calculate movie effect
+
+mu_hat <- mean(train_set$rating) 
+movie_avgs <- train_set %>% 
+    group_by(movieId) %>% 
+    summarize(b_i = mean(rating - mu_hat))
+
+predicted_ratings <- mu_hat + test_set %>% 
+    left_join(movie_avgs, by='movieId') %>%
+    .$b_i
+
+rmse2 <- RMSE(predicted_ratings, test_set$rating)
+```
+
+It's interesting to see that more movies are ranked below the average, 
+with small percentile of top 5-stars scorers:
+
+```{r movie-effect, echo=FALSE, fig.height=3}
+# plot movie effect
+
+movie_avgs %>% ggplot(aes(b_i)) +
+    geom_histogram(binwidth = 0.5, color = "grey", fill = "lightblue") +
+    ggtitle("Movie effect histogram") +
+    xlab("rating change") +
+    ylab("count")
+```
+\
+
+RMSE of ratings, once movie effect is incorporated, improves the prediction:
+```{r model2-rmse, echo=FALSE}
+rmse2  %>% knitr::kable(col.names = "Model RMSE")
+```
+
+### 3rd model: movie + user effect
+
+Individuals may differ in their preferences and characteristics of rating process.
+
+Hence the attempt to group their ratings per user, called user effect $b_{u}$
+
+Proposed model:
+$$y_{u,i} = \mu + b_{u} + b_{i} + \epsilon_{u,i}$$
+
+```{r model3, echo=FALSE}
+# calculate user effect
+
+user_avgs <- train_set %>% 
+    left_join(movie_avgs, by='movieId') %>%
+    group_by(userId) %>%
+    summarize(b_u = mean(rating - mu_hat - b_i))
+
+predicted_ratings <- test_set %>% 
+    left_join(movie_avgs, by='movieId') %>%
+    left_join(user_avgs, by='userId') %>%
+    mutate(pred = mu_hat + b_i + b_u) %>%
+    .$pred
+
+rmse3 <- RMSE(predicted_ratings, test_set$rating)
+```
+Usually there is more positive critisism among users:
+
+```{r model3-user-effect, echo = FALSE, fig.height=3}
+# plot user effect
+
+user_avgs %>% ggplot(aes(b_u)) +
+    geom_histogram(binwidth = 0.5, color = "grey", fill = "lightblue") +
+    ggtitle("User effect histogram") +
+    xlab("rating change") +
+    ylab("count")
+```
+\
+
+RMSE of ratings, when user and movie effects are incorporated:
+```{r model3-rmse, echo=FALSE}
+rmse3  %>% knitr::kable(col.names = "Model RMSE")
+```
+
+### 4th model: user + movie + genres effect
+
+Genres can be subjected to preference in rating, some enjoying greater biases,
+
+than others. Such as comedies which typically attract more critisism than dramas.
+
+```{r model4-genres-comparison, echo=FALSE}
+# different genres comparison
+
+res <- sapply(c("Action", "Drama", "Comedy", "Crime", "Sci-Fi", "Thriller", "Romance"), function(selected_genres) {
+    edx %>% filter(grepl(selected_genres, genres)) %>%
+    summarize(total = n(), avg = mean(rating))
+})
+res_columns <- dim(res)[2]
+res[2,1:res_columns] <- round(as.numeric(res[2,1:res_columns]),6)
+res %>% knitr::kable()
+```
+
+The genres effect is depicted as $b_{g}$ which is the effect of user's rating 
+of a movie classified by genres variable: $g_{u,i}$.
+
+Technically, $b_{g}$ is the captured intercept within each group of genres, 
+calculated (as for other effects) using arithmetic mean in each group.
+
+In order to simplify group filtering an indicator function is introduced: 
+
+$$1_{A}(\omega)=1$$ 
+whenever $\omega\in A$, $1_{A} = 0$ otherwise.
+
+Consequently, matching $g_{u,i}$ genres with selected $b_{g}(k)$ effect, 
+simplifies model formulation.
+
+Proposed model becomes:
+$$y_{u,i} = \mu + b_{u} + b_{i} + 1_{g_{u,i}=m}b_{g}(m) +\epsilon_{u,i}$$
+
+```{r model4, echo=FALSE}
+# calculate genres effect
+
+genres_avgs <- train_set %>% 
+    left_join(movie_avgs, by='movieId') %>%
+    left_join(user_avgs, by='userId') %>%
+    group_by(genres) %>%
+    summarize(b_g = mean(rating - mu_hat - b_i - b_u))
+
+predicted_ratings <- test_set %>% 
+    left_join(movie_avgs, by='movieId') %>%
+    left_join(user_avgs, by='userId') %>%
+    left_join(genres_avgs, by='genres') %>%
+    mutate(pred = mu_hat + b_i + b_u + b_g) %>%
+    .$pred
+
+rmse4 <- RMSE(predicted_ratings, test_set$rating)
+```
+
+Notably genres effect is hard to discern on distribution plot, despite bin's width being reduced to 1/4th of the rating point. 
+
+```{r genres-effect, echo = FALSE, fig.height=3}
+# plot genres effect
+
+genres_avgs %>% ggplot(aes(b_g)) +
+    geom_histogram(binwidth = 0.25, color = "grey", fill = "lightblue") +
+    ggtitle("Genres effect histogram") +
+    xlab("rating change") +
+    ylab("count")
+```
+\
+
+RMSE of ratings, once genres effect is incorporated, improves the prediction by a tiny fraction (4th decimal place vs previous model):
+```{r model4 rmse, echo=FALSE}
+rmse4  %>% knitr::kable(col.names = "Model RMSE")
+```
+
+### Regularisation of the best model
+
+Here, we consider regularisation formula being applied, using our candidate model:
+
+- intercept + movie + user + genres effect (4th model)
+
+Unlike linear regression as a function of lambda, 
+we minimize the formula below (based on model 4), containing the key penalty term:
+
+$$F(\lambda) = \frac{1}{N} \sum_{u,i} (y_{u,i} - \mu - b_{u} - b_{i}- 1_{g_{u,i}=m}b_{g}(m))^{2} + \lambda (\sum_{u}b_{u}^2+\sum_{i}b_{i}^2+\sum_{u,i}(1_{g_{u,i}=m}b_{g}(m))^2)$$
+
+Initially for $\lambda = 0$ we expect no regularisation impact on RMSE.
+The shrinkage penalty grows with $\lambda->\inf$, so finding optimised $\lambda$ estimate
+strikes the balance between over-trained model using training data (first part of) and reducing the impact of various effects.
+
+Once $F(\lambda)$ is differentiated with respect to each of the effect, regularisation routine can be put together.
+Here, the user effect penalized by shrinkage lamba:
+
+$$\frac{\delta F}{b_i}=b_i^{}(\lambda)=\frac{1}{\lambda+n_i}\sum_u^{n_i}(y_{u,i}-\mu)$$
+Differentiation vs all effects was implemented in the same fashion as $\frac{\delta F}{b_i}$ by extending residuals term on the right hand side of the formula.   
+
+Regularisation process was conducted on the $\lambda \in [0,10]$ at 0.25 increments.
+
+More granular values of $\lambda$ produced no improvement of residuals and were discarded.
+
+```{r modelR-regularised, echo=FALSE}
+# run regularisation with lambda sequence
+
+lambdas <- seq(0, 10, 0.25)
+mu <- mean(train_set$rating)
+rmses <- sapply(lambdas, function(lambda_arg){
+    b_i <- train_set %>%
+        group_by(movieId) %>%
+        summarize(b_i = sum(rating - mu)/(n()+lambda_arg))
+    b_u <- train_set %>% 
+        left_join(b_i, by="movieId") %>%
+        group_by(userId) %>%
+        summarize(b_u = sum(rating - mu - b_i)/(n()+lambda_arg))
+    b_g <- train_set %>% 
+        left_join(b_i, by='movieId') %>%
+        left_join(b_u, by='userId') %>%
+        group_by(genres) %>%
+        summarize(b_g = sum(rating - mu - b_i - b_u)/(n()+lambda_arg))
+    # complete model
+    predicted_ratings <- 
+        test_set %>% 
+        left_join(b_i, by = "movieId") %>%
+        left_join(b_u, by = "userId") %>%
+        left_join(b_g, by = "genres") %>%
+        mutate(estimate = mu + b_i + b_u + b_g) %>%
+        .$estimate
+    last_rmse <- RMSE(predicted_ratings, test_set$rating)
+    return(last_rmse)
+})
+```
+
+```{r modelR-regularised-curve, echo=FALSE, fig.height=3}
+rmse_lambdas <- tibble(rmse = rmses, lambda = lambdas)
+rmse_lambdas %>% ggplot(aes(x = lambdas, y = rmses)) +
+  geom_line(color = "red") +
+  geom_point(color = "blue") +
+  ggtitle("Minimization of residuals") +
+  xlab("Lambda") +
+  ylab("RMSE")
+```
+\
+
+From the curve we obtain the optimal lambda of the regularized model:
+
+```{r modelR-lambda, echo=FALSE}
+lambda <- lambdas[which.min(rmses)]
+lambda  %>% knitr::kable(col.names = "Regularisation Lambda")
+```
+
+It yields an improved scored of RMSE, be aware that we're looking at the model built on training data:
+```{r modelR-rmse, echo=FALSE}
+rmseR <- rmses[which.min(rmses)]
+rmseR  %>% knitr::kable(col.names = "RMSE")
+```
+
+
+## 3. Results
+
+At this point we aggregated user, movie, and generes effect, trained using edx data set.
+
+Optimal shrinkage penalty $\lambda$ can be included in our final computation:
+
+```{r final-model-lambda, echo=FALSE}
+lambda %>% knitr::kable(col.names = "Lambda")
+```
+
+Validation set calculation result:
+
+```{r validation-rmse, echo=FALSE}
+# validation set RMSE calculation
+
+mu <- mean(edx$rating)
+b_i <- edx %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+lambda))
+b_u <- edx %>% 
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - mu - b_i)/(n()+lambda))
+b_g <- edx %>% 
+    left_join(b_i, by='movieId') %>%
+    left_join(b_u, by='userId') %>%
+    group_by(genres) %>%
+    summarize(b_g = sum(rating - mu - b_i - b_u)/(n()+lambda))
+predicted_ratings <- 
+    validation %>% 
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    left_join(b_g, by = "genres") %>%
+    mutate(pred = mu + b_i + b_u + b_g) %>%
+    .$pred
+validation_rmse <- RMSE(predicted_ratings, validation$rating)
+validation_rmse  %>% knitr::kable(col.names = "RMSE")
+```
+
+Let's look at the comparison of regularised effects collected.
+
+```{r rmse-raw-data, echo=FALSE, fig.height=3}
+# calculate raw effects with lambda = 0, unregularised
+
+b_i_raw <- edx %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()), n_count = n())
+b_u_raw <- edx %>% 
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - mu - b_i)/(n()), n_count = n())
+b_g_raw <- edx %>% 
+    left_join(b_i, by='movieId') %>%
+    left_join(b_u, by='userId') %>%
+    group_by(genres) %>%
+    summarize(b_g = sum(rating - mu - b_i - b_u)/(n()), n_count = n())
+
+# combine regularised effect with raw effects for qq-plotting
+
+reg_u_data <- tibble(regularised = b_u_raw$b_u, raw = b_u$b_u, n = b_u_raw$n_count)
+reg_i_data <- tibble(regularised = b_i_raw$b_i, raw = b_i$b_i, n = b_i_raw$n_count)
+reg_g_data <- tibble(regularised = b_g_raw$b_g, raw = b_g$b_g, n = b_g_raw$n_count)
+rm(b_i, b_u, b_g, b_i_raw, b_u_raw, b_g_raw)
+```
+
+```{r comparison-chart-regularised-user-effect, echo=FALSE, fig.height=3}
+reg_u_data %>% ggplot(aes(raw, regularised, size = sqrt(n))) + 
+  geom_point(shape = 1, alpha = 0.5, color = "blue") +
+  ggtitle("Regularised user effect vs unregularised") + 
+  xlab("unregularised")
+```
+\
+
+```{r comparison-chart-regularised-movie-effect, echo=FALSE, fig.height=3}
+reg_i_data %>% ggplot(aes(raw, regularised, size = sqrt(n))) + 
+  geom_point(shape = 1, alpha = 0.5, color = "blue") +
+  ggtitle("Regularised movie effect vs unregularised") + 
+  xlab("unregularised")
+```
+\
+
+```{r comparison-chart-regularised-genres-effect, echo=FALSE, fig.height=3}
+reg_g_data %>% ggplot(aes(raw, regularised, size = sqrt(n))) + 
+  geom_point(shape = 1, alpha = 0.5, color = "blue") +
+  ggtitle("Regularised genres effect vs unregularised") + 
+  xlab("unregularised")
+rm(mu, reg_u_data, reg_i_data, reg_g_data)
+```
+\
+
+One can notice that shrinkage affects the explanatory variables:
+
+- the least rated movies,
+
+- users with least ratings,
+
+- genres with fewer movie ratings (but more evident concentration of popular genres) 
+
+### Models comparison
+
+Given past results from training set (edx data) and the final model performance (validation data)
+it's possible to compare the impact of selected effect variables. 
+
+```{r validation-vs-training-rmse-comparison, echo=FALSE}
+# models comparison, indicated improvements in rating error
+
+all_results <- data.frame(
+    model_type = c("intercept only", 
+                   "movie effect", 
+                   "movie + user effect", 
+                   "movie + user + genres effect", 
+                   "regularized 'movie + user + genres effect'", 
+                   "regularized 'movie + user + genres effect' (validation set)"), 
+    rmse = c(rmse1, rmse2, rmse3, rmse4, rmseR, validation_rmse))
+all_results <- all_results %>% mutate(imp = (lag(rmse)-rmse))
+all_results$imp[1] <- all_results$rmse[1]
+all_results %>% knitr::kable(col.names = c("Model Type", "RMSE", "Improvement"))
+```
+
+Looking at rating improvement one notices that adding movie effect in general provided the best predicting power once the mean intercept effect is discounted.
+
+If one predicts rating of an out-of-sample movie, bidding solely on average rating (the intercept model) is the strongest feature of all.
+Yet, it's an error hardly acceptable, residing within an entire rating point. 
+
+Regularisation of the full model (intercept + movie + user + genres effect), had greater fractional impact than genres effect for instance. 
+The latter, genres effect, was the least important factor.
+
+Finally once out-of-sample, the validation set, data was employed, the drop in predicting accuracy was less than 1/1000-th only.
+
+## 4. Conclusion
+
+Modicum of intuition produced a number of 'effect' variables with minimum statistical apparatus.
+The objective of modeling movie ratings, with ultimate minimisation of the RMSE proved a viable statistical exercise.
+
+Limitation of available CPU power available, played a major role during the study.
+However, thanks to multi-threaded math libraries provided by Microsoft R Open the research 
+took half of time, or even less compared with initial effort using single-threaded framework.
+
+Model-wise, several other features, or additional instrumental variables could have been investigated.
+Such as:
+
+- time&calendar impact, 
+
+- cross-effects of existing features, or 
+
+- tail-anomalies for users and movies
+
+Cross-validation technique wasn't employed for numerical simplicity reasons, 
+but would be a welcome continuation of the study. 
+Same applies to residuals analysis of the unregularised model with emphasis on
+heteroscedasticity and serial correlation, with latent effects in mind.
+
+Going beyond linear modelling, we could achieve greater accuracy 
+with an ensemble of different techniques, 
+still being adversely limited due to computation costs.
+
+Summarizing, a very basic approach led to a promising entry model for movie rating.
+
